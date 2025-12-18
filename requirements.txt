@@ -1,0 +1,16 @@
+pymupdf
+langchain
+langchain_community
+langchain_core
+numpy
+Pillow
+scikit_learn
+torch
+torchvision
+transformers
+langchain-text-splitters
+langchain-openai
+faiss-cpu
+streamlit
+python-dotenv
+ipywidgets
