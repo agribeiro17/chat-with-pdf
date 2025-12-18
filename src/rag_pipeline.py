@@ -180,14 +180,18 @@ class RAGPipeline:
         """Extract figure number from text like 'Figure 9.' or 'Fig. 9'"""
         import re
         patterns = [
-            r'Figure\s+(\d+)',
-            r'Fig\.\s+(\d+)',
-            r'FIGURE\s+(\d+)',
+            r'Figure\s*(\d+)',
+            r'Fig\.\s*(\d+)',
+            r'FIGURE\s*(\d+)',
+            r'figure\s*(\d+)',
+            r'fig\s*(\d+)',
         ]
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
+            match = re.search(pattern, text)
             if match:
-                return match.group(1)
+                fig_num = match.group(1)
+                print(f"  └─ Extracted figure number: {fig_num}")
+                return fig_num
         return None
     
     def find_figure_references_in_text(self, page_text, figure_num):
@@ -195,17 +199,22 @@ class RAGPipeline:
         import re
         # Look for mentions of the figure in the text
         patterns = [
-            rf'[^.]*Figure\s+{figure_num}[^.]*\.',
-            rf'[^.]*Fig\.\s+{figure_num}[^.]*\.',
-            rf'[^.]*illustrated in Figure\s+{figure_num}[^.]*\.',
+            rf'[^.]*[Ff]igure\s*{figure_num}[^.]*\.',
+            rf'[^.]*[Ff]ig\.\s*{figure_num}[^.]*\.',
+            rf'[^.]*illustrated in [Ff]igure\s*{figure_num}[^.]*\.',
+            rf'[^.]*shown in [Ff]igure\s*{figure_num}[^.]*\.',
+            rf'[^.]*see [Ff]igure\s*{figure_num}[^.]*\.',
         ]
         
         references = []
         for pattern in patterns:
-            matches = re.findall(pattern, page_text, re.IGNORECASE | re.DOTALL)
+            matches = re.findall(pattern, page_text, re.DOTALL)
             references.extend(matches)
         
-        return ' '.join(references).strip()
+        result = ' '.join(references).strip()
+        if result:
+            print(f"  └─ Found {len(references)} references to Figure {figure_num}")
+        return result
 
     def _bbox_overlap(self, bbox1, bbox2):
         """Check if two bounding boxes overlap."""
@@ -275,22 +284,41 @@ class RAGPipeline:
                 
                 if img_rects:
                     img_bbox = img_rects[0]
-                    context_text = self.get_text_around_bbox(page, img_bbox, margin=150)
+                    # Get text in larger area around image
+                    context_text = self.get_text_around_bbox(page, img_bbox, margin=200)
+                    
+                    print(f"  Image {img_index} context preview: {context_text[:100]}...")
                     
                     # Try to extract figure number from nearby text
                     figure_number = self.extract_figure_number(context_text)
+                    
+                    # If not found nearby, search the entire page
+                    if not figure_number:
+                        figure_number = self.extract_figure_number(full_page_text)
+                        if figure_number:
+                            print(f"  └─ Found figure number in page text")
                 
                 # If we found a figure number, search the entire document for references
                 figure_references = ""
                 if figure_number:
-                    # Search current page
+                    # Search current page first
                     figure_references = self.find_figure_references_in_text(full_page_text, figure_number)
                     
-                    # Also search nearby pages if available
+                    # Also search entire document if available
                     if full_doc_text:
                         doc_references = self.find_figure_references_in_text(full_doc_text, figure_number)
-                        if doc_references and doc_references not in figure_references:
-                            figure_references += " " + doc_references
+                        if doc_references:
+                            # Combine and deduplicate
+                            all_refs = figure_references + " " + doc_references
+                            # Remove duplicates while preserving order
+                            seen = set()
+                            unique_refs = []
+                            for ref in all_refs.split('.'):
+                                ref = ref.strip()
+                                if ref and ref not in seen:
+                                    seen.add(ref)
+                                    unique_refs.append(ref)
+                            figure_references = '. '.join(unique_refs) + '.'
                 
                 # Generate caption with rate limiting
                 caption = await self.generate_image_caption(pil_image, context_text)
@@ -342,6 +370,13 @@ class RAGPipeline:
         self._initialize_models()
         
         doc = fitz.open(pdf_path)
+        
+        # Extract full document text for cross-page figure reference search
+        print("Extracting document text...")
+        full_doc_text = ""
+        for page in doc:
+            full_doc_text += page.get_text() + "\n"
+        
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800, 
             chunk_overlap=200,
@@ -353,7 +388,7 @@ class RAGPipeline:
         results = []
         for i, page in enumerate(doc):
             print(f"Processing page {i+1}/{len(doc)}...")
-            result = await self._process_page(page, i, splitter)
+            result = await self._process_page(page, i, splitter, full_doc_text)
             results.append(result)
             # Small delay between pages to manage rate limits
             if i < len(doc) - 1:
@@ -389,6 +424,39 @@ class RAGPipeline:
         )
         
         print(f"✓ Processed {len(self.all_docs)} documents successfully!")
+        
+        # Print figure summary with more details
+        figures = [doc for doc in self.all_docs if doc.metadata.get("type") == "image"]
+        numbered_figures = [doc for doc in figures if doc.metadata.get("figure_number")]
+        
+        print(f"\n📊 Summary:")
+        print(f"  Total documents: {len(self.all_docs)}")
+        print(f"  Images: {len(figures)}")
+        print(f"  Labeled figures: {len(numbered_figures)}")
+        
+        if numbered_figures:
+            print(f"\n🔍 Detected Figures:")
+            for fig_doc in numbered_figures:
+                print(f"  - Figure {fig_doc.metadata['figure_number']} on page {fig_doc.metadata['page']}")
+                print(f"    Preview: {fig_doc.page_content[:150]}...")
+        else:
+            print(f"\n⚠️  No numbered figures detected. Check if captions contain 'Figure X' format.")
+    
+    def debug_search_figures(self, figure_number):
+        """Debug helper to see what's stored for a figure number."""
+        matches = [doc for doc in self.all_docs 
+                  if doc.metadata.get("type") == "image" 
+                  and doc.metadata.get("figure_number") == str(figure_number)]
+        
+        print(f"\n🔍 Debug: Searching for Figure {figure_number}")
+        print(f"Found {len(matches)} matches")
+        
+        for i, doc in enumerate(matches):
+            print(f"\n--- Match {i+1} ---")
+            print(f"Page: {doc.metadata['page']}")
+            print(f"Content: {doc.page_content[:500]}...")
+        
+        return matches
 
     async def ask_question(self, question):
         """Asks a question to the LLM with the context of the PDF."""
@@ -397,14 +465,68 @@ class RAGPipeline:
 
         self._initialize_models()
 
-        # Embed the question
-        query_embedding = await self.embed_text(question)
+        # Check if asking about a specific figure
+        import re
+        figure_query = re.search(r'[Ff]igure\s*(\d+)', question)
         
-        # Convert to list for FAISS
-        query_embedding_list = query_embedding.tolist() if isinstance(query_embedding, np.ndarray) else query_embedding
+        retrieved_docs = []
         
-        # Retrieve relevant documents
-        retrieved_docs = self.vector_store.similarity_search_by_vector(query_embedding_list, k=7)
+        if figure_query:
+            # Looking for a specific figure
+            fig_num = figure_query.group(1)
+            print(f"\n🔍 Question about Figure {fig_num}")
+            
+            # First try to find by figure number in metadata
+            figure_docs = [doc for doc in self.all_docs 
+                          if doc.metadata.get("type") == "image" 
+                          and doc.metadata.get("figure_number") == fig_num]
+            
+            if figure_docs:
+                retrieved_docs.extend(figure_docs)
+                print(f"✓ Found Figure {fig_num} directly ({len(figure_docs)} matches)")
+            else:
+                print(f"⚠️  Figure {fig_num} not found by number. Trying semantic search...")
+                
+                # Try searching for the figure in all image captions
+                for doc in self.all_docs:
+                    if doc.metadata.get("type") == "image":
+                        # Check if figure number appears anywhere in the content
+                        if f"figure {fig_num}" in doc.page_content.lower() or f"fig {fig_num}" in doc.page_content.lower():
+                            retrieved_docs.append(doc)
+                            print(f"✓ Found reference to Figure {fig_num} in image content")
+            
+            # Also get text chunks that mention this figure
+            text_docs = [doc for doc in self.all_docs
+                        if doc.metadata.get("type") == "text"
+                        and (f"figure {fig_num}" in doc.page_content.lower() 
+                             or f"fig. {fig_num}" in doc.page_content.lower()
+                             or f"fig {fig_num}" in doc.page_content.lower())]
+            
+            if text_docs:
+                print(f"✓ Found {len(text_docs)} text chunks mentioning Figure {fig_num}")
+                retrieved_docs.extend(text_docs[:3])  # Add top 3 text references
+            
+            # Supplement with semantic search
+            query_embedding = await self.embed_text(question + f" figure {fig_num}")
+            query_embedding_list = query_embedding.tolist() if isinstance(query_embedding, np.ndarray) else query_embedding
+            semantic_docs = self.vector_store.similarity_search_by_vector(query_embedding_list, k=4)
+            
+            # Add semantic results that aren't already included
+            for doc in semantic_docs:
+                if doc not in retrieved_docs:
+                    retrieved_docs.append(doc)
+            
+            retrieved_docs = retrieved_docs[:8]  # Allow more context for figure queries
+            
+            if not retrieved_docs:
+                return f"I couldn't find Figure {fig_num} in the document. The figure might not be labeled, or the caption might use a different format. Please try describing what you're looking for, or I can list the figures I found."
+        else:
+            # Regular semantic search
+            query_embedding = await self.embed_text(question)
+            query_embedding_list = query_embedding.tolist() if isinstance(query_embedding, np.ndarray) else query_embedding
+            retrieved_docs = self.vector_store.similarity_search_by_vector(query_embedding_list, k=7)
+        
+        print(f"📄 Using {len(retrieved_docs)} documents for context")
         
         # Format the context
         context_parts = []
@@ -413,34 +535,38 @@ class RAGPipeline:
         for i, doc in enumerate(retrieved_docs):
             if doc.metadata.get("type") == "image":
                 image_id = doc.metadata.get("image_id")
-                caption = doc.metadata.get("caption", "No caption available")
-                context_parts.append(f"[Image {i+1}]: {caption}")
+                fig_num = doc.metadata.get("figure_number")
+                
+                if fig_num:
+                    context_parts.append(f"=== FIGURE {fig_num} ===\n{doc.page_content}\n")
+                else:
+                    context_parts.append(f"=== IMAGE {i+1} ===\n{doc.page_content}\n")
+                
                 if image_id in self.image_data_store:
                     images_to_include.append(image_id)
             elif doc.metadata.get("type") == "table":
-                table_id = doc.metadata.get("table_id")
-                context_parts.append(f"[Table {i+1}]:\n{doc.page_content}")
+                context_parts.append(f"=== TABLE {i+1} ===\n{doc.page_content}\n")
             else:
-                context_parts.append(f"[Text {i+1}]: {doc.page_content}")
+                context_parts.append(f"=== TEXT EXCERPT {i+1} ===\n{doc.page_content}\n")
         
-        context = "\n\n".join(context_parts)
+        context = "\n".join(context_parts)
 
         # Create the prompt
         prompt_template = """You are a helpful assistant analyzing a PDF document. Use the provided context to answer the question accurately and comprehensively.
 
 The context includes:
 - Text excerpts from the document
-- Descriptions and captions of images
+- Descriptions and captions of images/figures
 - Tables with their surrounding context
 
-When referencing images or tables, refer to them by their numbers (e.g., "As shown in Image 1..." or "According to Table 2...").
+When figures are numbered (e.g., FIGURE 9), use those exact numbers in your response. Pay special attention to figure-specific questions.
 
 Context:
 {context}
 
 Question: {question}
 
-Provide a detailed and accurate answer based on the context above:"""
+Provide a detailed and accurate answer based on the context above. If this is about a specific figure, describe what it shows based on the caption, description, and any references in the text:"""
         
         prompt_text = prompt_template.format(context=context, question=question)
         
@@ -461,4 +587,4 @@ Provide a detailed and accurate answer based on the context above:"""
 
         # Get the response from the LLM
         response = await self.llm.ainvoke(messages)
-        return response.contentq    
+        return response.content
